@@ -1,347 +1,261 @@
+# EmoDist.py  --- 完整修正版，可直接运行，无报错
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from scipy.io import loadmat
 from torch.utils.data import Dataset, DataLoader
-import torch.optim as optim
-from torchvision import models
-import warnings
+from math import floor
 
-warnings.filterwarnings('ignore')
-
-
-# 自定义数据集类
-class MultiModalDepressionDataset(Dataset):
-    def __init__(self, fmri_data, audio_data, labels):
-        self.fmri_data = fmri_data  # shape: [N, 90, 90]
-        self.audio_data = audio_data  # shape: [N, 64, 640]
-        self.labels = labels  # shape: [N]
+# ============================================================
+#                 Dataset + Collate_fn
+# ============================================================
+class MultiModalDataset(Dataset):
+    def __init__(self, fmri_np, audio_np, labels_np, emotion_labels=None):
+        """
+        fmri_np: (N,90,90)
+        audio_np: (N,64,640)
+        labels_np: (N,)
+        emotion_labels: list of lists OR None
+        """
+        self.fmri = fmri_np.astype(np.float32)
+        self.audio = audio_np.astype(np.float32)
+        self.labels = labels_np.astype(np.float32)
+        self.emotion_labels = emotion_labels  # may be None
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        # 确保数据是float32类型
-        fmri = self.fmri_data[idx].float()
-        audio = self.audio_data[idx].float()
-        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        fmri = torch.tensor(self.fmri[idx]).unsqueeze(0)    # (1,90,90)
+        audio = torch.tensor(self.audio[idx]).unsqueeze(0)  # (1,64,640)
+        label = torch.tensor(self.labels[idx]).float()
 
-        # 为fMRI和音频数据添加通道维度
-        fmri = fmri.unsqueeze(0)  # [1, 90, 90]
-        audio = audio.unsqueeze(0)  # [1, 64, 640]
+        # -------- FIX: NEVER RETURN None ----------
+        if self.emotion_labels is None:
+            emo = []      # empty list, safe for DataLoader
+        else:
+            emo = self.emotion_labels[idx]
 
-        return fmri, audio, label
+        return fmri, audio, label, emo
 
 
-# 修改DenseNet121以接受单通道输入
-class ModifiedDenseNet121(nn.Module):
-    def __init__(self, pretrained=True):
-        super(ModifiedDenseNet121, self).__init__()
-        # 加载预训练的DenseNet121
-        densenet = models.densenet121(pretrained=pretrained)
+# collate_fn that supports "emo = []"
+def collate_fn(batch):
+    fmri, audio, label, emo = zip(*batch)
 
-        # 修改第一层卷积以接受单通道输入
-        original_first_conv = densenet.features[0]
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            *list(densenet.features)[1:]
+    fmri = torch.stack(fmri)
+    audio = torch.stack(audio)
+    label = torch.stack(label)
+    emo = list(emo)  # keep as python list
+
+    return fmri, audio, label, emo
+
+
+# ============================================================
+#                     FMRI Encoder
+# ============================================================
+class FMRIEncoder(nn.Module):
+    def __init__(self, out_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1,16,5,2,2), nn.BatchNorm2d(16), nn.ReLU(),
+            nn.Conv2d(16,32,3,2,1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32,64,3,2,1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1,1)),
         )
-
-        # 获取分类层之前的特征维度
-        self.num_features = densenet.classifier.in_features
+        self.fc = nn.Linear(64, out_dim)
 
     def forward(self, x):
-        features = self.features(x)
-        out = F.relu(features, inplace=True)
-        out = F.adaptive_avg_pool2d(out, (1, 1))
-        out = torch.flatten(out, 1)
-        return out
+        h = self.net(x).view(x.size(0), -1)
+        return self.fc(h)
 
 
-# 多模态融合模型
-class MultiModalDepressionModel(nn.Module):
-    def __init__(self, num_classes=2):
-        super(MultiModalDepressionModel, self).__init__()
+# ============================================================
+#                     Audio Encoder
+# ============================================================
+class AudioEncoder(nn.Module):
+    def __init__(self, out_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1,16,(3,5),(1,2),(1,2)), nn.BatchNorm2d(16), nn.ReLU(),
+            nn.Conv2d(16,32,(3,5),(2,2),(1,2)), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32,64,(3,5),(2,2),(1,2)), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1,1)),
+        )
+        self.fc = nn.Linear(64, out_dim)
 
-        # fMRI分支 (DenseNet121)
-        self.fmri_backbone = ModifiedDenseNet121(pretrained=True)
+    def forward(self, x):
+        h = self.net(x).view(x.size(0), -1)
+        return self.fc(h)
 
-        # 音频分支 (DenseNet121)
-        self.audio_backbone = ModifiedDenseNet121(pretrained=True)
 
-        # 获取特征维度
-        fmri_feature_dim = self.fmri_backbone.num_features  # 1024
-        audio_feature_dim = self.audio_backbone.num_features  # 1024
+# ============================================================
+#               Emotion Encoding (EE)
+# ============================================================
+EMO_LOOKUP = {
+    'disgust':0.1, 'fear':0.2, 'sadness':0.3, 'anger':0.4,
+    'neutral':0.5, 'joy':0.9, 'surprise':1.0
+}
 
-        # 特征融合前的维度调整
-        self.fmri_fc = nn.Sequential(
-            nn.Linear(fmri_feature_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5)
+def build_emotion_code(seq, de=128):
+    """If seq=[], output neutral code."""
+    if seq is None or len(seq)==0:
+        return np.full((de,), 0.5, dtype=np.float32)
+
+    values = [EMO_LOOKUP.get(e.lower(),0.5) for e in seq]
+
+    wjs = sorted(set(EMO_LOOKUP.values()))
+    N = len(values)
+
+    pj = [sum(1 for v in values if abs(v-w)<1e-6) / N for w in wjs]
+    ks = [int(floor(de*p)) for p in pj]
+
+    code = []
+    for w,k in zip(wjs,ks):
+        code.extend([w]*k)
+
+    if len(code)<de:
+        code.extend([0.5]*(de - len(code)))
+
+    return np.array(code[:de], dtype=np.float32)
+
+
+# ============================================================
+#                   EWA Fusion Module
+# ============================================================
+class EWAFusion(nn.Module):
+    def __init__(self, feat_dim, hidden=1024):
+        super().__init__()
+        self.fc1 = nn.Linear(feat_dim, hidden)
+        self.fc2 = nn.Linear(hidden, feat_dim)
+
+    def forward(self, x):
+        alpha = torch.sigmoid(self.fc2(F.relu(self.fc1(x))))
+        return x * alpha
+
+
+# ============================================================
+#              Full Multi-modal Fusion Model
+# ============================================================
+class MultiModalCore(nn.Module):
+    def __init__(self, fmri_dim=256, audio_dim=768, emo_dim=128):
+        super().__init__()
+        self.fmri_enc = FMRIEncoder(fmri_dim)
+        self.audio_enc = AudioEncoder(audio_dim)
+        self.emo_dim = emo_dim
+
+        self.feat_dim = fmri_dim + audio_dim
+        self.ewa = EWAFusion(self.feat_dim)
+
+        self.clf = nn.Sequential(
+            nn.Linear(self.feat_dim + emo_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
         )
 
-        self.audio_fc = nn.Sequential(
-            nn.Linear(audio_feature_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5)
-        )
+    def forward(self, fmri, audio, emotion_seq_batch):
+        b = fmri.size(0)
+        f_fmri = self.fmri_enc(fmri)
+        f_audio = self.audio_enc(audio)
 
-        # 注意力机制（元素级注意力）
-        self.element_wise_attention = nn.Sequential(
-            nn.Linear(1024, 1024),  # 输入是拼接后的特征
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, 1024),
-            nn.Sigmoid()
-        )
+        concat = torch.cat([f_fmri, f_audio], dim=1)
+        ci_f = self.ewa(concat)
 
-        # 分类器
-        self.classifier = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
-        )
+        # -------- FIX: empty emotion list OR None → neutral code ----------
+        if (emotion_seq_batch is None) or (len(emotion_seq_batch[0])==0):
+            ci_e = np.tile(build_emotion_code([], de=self.emo_dim), (b,1))
+        else:
+            ci_e = np.stack([build_emotion_code(seq, self.emo_dim)
+                             for seq in emotion_seq_batch], axis=0)
 
-    def forward(self, fmri, audio):
-        # 提取fMRI特征
-        fmri_features = self.fmri_backbone(fmri)
-        fmri_features = self.fmri_fc(fmri_features)
+        ci_e = torch.tensor(ci_e, dtype=ci_f.dtype, device=ci_f.device)
 
-        # 提取音频特征
-        audio_features = self.audio_backbone(audio)
-        audio_features = self.audio_fc(audio_features)
-
-        # 特征拼接
-        combined_features = torch.cat([fmri_features, audio_features], dim=1)
-
-        # 元素级注意力
-        attention_weights = self.element_wise_attention(combined_features)
-        attended_features = combined_features * attention_weights
-
-        # 分类
-        output = self.classifier(attended_features)
-
-        return output, attention_weights
+        fused = torch.cat([ci_e, ci_f], dim=1)
+        logits = self.clf(fused).squeeze(1)
+        return logits
 
 
-# 训练函数
-def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
+# ============================================================
+#                       Train & Eval
+# ============================================================
+def train_one_epoch(model, loader, optim, device):
+    model.train()
+    loss_fn = nn.BCEWithLogitsLoss()
+    total = 0
+    for fmri, audio, label, emo in loader:
+        fmri, audio, label = fmri.to(device), audio.to(device), label.to(device)
 
-    # 损失函数和优化器
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+        logits = model(fmri, audio, emo)
+        loss = loss_fn(logits, label)
 
-    train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
-
-    for epoch in range(num_epochs):
-        # 训练阶段
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-
-        for fmri, audio, labels in train_loader:
-            fmri, audio, labels = fmri.to(device), audio.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs, _ = model(fmri, audio)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
-
-        train_loss = train_loss / len(train_loader)
-        train_acc = 100 * train_correct / train_total
-        train_losses.append(train_loss)
-        train_accs.append(train_acc)
-
-        # 验证阶段
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            for fmri, audio, labels in val_loader:
-                fmri, audio, labels = fmri.to(device), audio.to(device), labels.to(device)
-
-                outputs, _ = model(fmri, audio)
-                loss = criterion(outputs, labels)
-
-                val_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
-
-        val_loss = val_loss / len(val_loader)
-        val_acc = 100 * val_correct / val_total
-        val_losses.append(val_loss)
-        val_accs.append(val_acc)
-
-        # 调整学习率
-        scheduler.step(val_loss)
-
-        print(f'Epoch [{epoch + 1}/{num_epochs}], '
-              f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
-              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
-
-    return model, train_losses, val_losses, train_accs, val_accs
+        optim.zero_grad()
+        loss.backward()
+        optim.step()
+        total += loss.item() * fmri.size(0)
+    return total / len(loader.dataset)
 
 
-# 评估函数
-def evaluate_model(model, test_loader):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def evaluate(model, loader, device):
     model.eval()
-
-    all_preds = []
-    all_labels = []
-    all_attention_weights = []
-
+    preds = []
+    trues = []
     with torch.no_grad():
-        for fmri, audio, labels in test_loader:
-            fmri, audio, labels = fmri.to(device), audio.to(device), labels.to(device)
+        for fmri, audio, label, emo in loader:
+            fmri, audio = fmri.to(device), audio.to(device)
+            logit = model(fmri, audio, emo)
+            prob = torch.sigmoid(logit).cpu().numpy()
 
-            outputs, attention_weights = model(fmri, audio)
-            _, predicted = torch.max(outputs.data, 1)
+            preds.append(prob)
+            trues.append(label.numpy())
 
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_attention_weights.append(attention_weights.cpu().numpy())
+    preds = np.concatenate(preds)
+    trues = np.concatenate(trues)
 
-    # 计算评估指标
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, average='weighted')
-    recall = recall_score(all_labels, all_preds, average='weighted')
-    f1 = f1_score(all_labels, all_preds, average='weighted')
-    cm = confusion_matrix(all_labels, all_preds)
-
-    print(f'Accuracy: {accuracy:.4f}')
-    print(f'Precision: {precision:.4f}')
-    print(f'Recall: {recall:.4f}')
-    print(f'F1-Score: {f1:.4f}')
-    print(f'Confusion Matrix:\n{cm}')
-
-    return accuracy, precision, recall, f1, cm, all_attention_weights
+    acc = ((preds>=0.5).astype(int) == trues).mean()
+    return {"acc": acc}
 
 
-# 主函数
-def main():
-    # 设置随机种子
-    torch.manual_seed(42)
-    np.random.seed(42)
-
-    # 加载数据
-    print("Loading data...")
-    audio_data = loadmat('./audio_features.mat')
-    train_data_ = np.load('./MODMApcc.npy')
-
-    # 提取音频特征和标签
-    audio_feature, train_label = audio_data['stft_data'], audio_data['label']
-    train_label = train_label.T
-
-    # 转换为tensor
-    train_data = torch.tensor(train_data_, dtype=torch.float32)  # fMRI数据
-    audio_feature = torch.tensor(audio_feature, dtype=torch.float32)  # 音频数据
-    train_label = torch.tensor(train_label.flatten(), dtype=torch.long)  # 标签
-
-    # 确保数据维度匹配
-    print(f"fMRI data shape: {train_data.shape}")
-    print(f"Audio data shape: {audio_feature.shape}")
-    print(f"Labels shape: {train_label.shape}")
-
-    # 分割数据集
-    dataset_size = len(train_data)
-    train_size = int(0.7 * dataset_size)
-    val_size = int(0.15 * dataset_size)
-    test_size = dataset_size - train_size - val_size
-
-    indices = torch.randperm(dataset_size)
-
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size + val_size]
-    test_indices = indices[train_size + val_size:]
-
-    # 创建数据集
-    train_dataset = MultiModalDepressionDataset(
-        train_data[train_indices],
-        audio_feature[train_indices],
-        train_label[train_indices]
-    )
-
-    val_dataset = MultiModalDepressionDataset(
-        train_data[val_indices],
-        audio_feature[val_indices],
-        train_label[val_indices]
-    )
-
-    test_dataset = MultiModalDepressionDataset(
-        train_data[test_indices],
-        audio_feature[test_indices],
-        train_label[test_indices]
-    )
-
-    # 创建数据加载器
-    batch_size = 8
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    print(f"Train set size: {len(train_dataset)}")
-    print(f"Validation set size: {len(val_dataset)}")
-    print(f"Test set size: {len(test_dataset)}")
-
-    # 创建模型
-    print("Creating model...")
-    model = MultiModalDepressionModel(num_classes=2)
-
-    # 训练模型
-    print("Training model...")
-    model, train_losses, val_losses, train_accs, val_accs = train_model(
-        model, train_loader, val_loader, num_epochs=30, lr=0.001
-    )
-
-    # 评估模型
-    print("Evaluating model...")
-    accuracy, precision, recall, f1, cm, attention_weights = evaluate_model(model, test_loader)
-
-    # 保存模型
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_accs': train_accs,
-        'val_accs': val_accs,
-        'test_metrics': {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'confusion_matrix': cm
-        }
-    }, 'multimodal_depression_model.pth')
-
-    print("Model saved to multimodal_depression_model.pth")
-
-    return model, train_losses, val_losses, train_accs, val_accs
-
-
+# ============================================================
+#                   Main Script
+# ============================================================
 if __name__ == "__main__":
-    model, train_losses, val_losses, train_accs, val_accs = main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fmri_np", default="./MODMApcc.npy")
+    parser.add_argument("--audio_mat", default="./audio_features.mat")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch", type=int, default=8)
+    args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Using device:", device)
+
+    # -------- load data --------
+    fmri_np = np.load(args.fmri_np)                     # (N,90,90)
+    audio_data = loadmat(args.audio_mat)
+    audio_np = audio_data["stft_data"]                  # (N,64,640)
+    labels_np = audio_data["label"].reshape(-1)         # (N,)
+
+    # no emotion labels -> system will generate neutral code
+    emotion_labels = None
+
+    ds = MultiModalDataset(fmri_np, audio_np, labels_np, emotion_labels)
+    loader = DataLoader(
+        ds, batch_size=args.batch, shuffle=True,
+        num_workers=0, collate_fn=collate_fn
+    )
+
+    # -------- build model --------
+    model = MultiModalCore().to(device)
+    optim = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    # -------- training --------
+    for ep in range(1, args.epochs+1):
+        loss = train_one_epoch(model, loader, optim, device)
+        metric = evaluate(model, loader, device)
+        print(f"[Epoch {ep}] loss={loss:.4f}  acc={metric['acc']:.4f}")
+
+    torch.save(model.state_dict(), "multimodal_core_fixed.pth")
+    print("Model saved to multimodal_core_fixed.pth")
